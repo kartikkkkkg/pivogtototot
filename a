@@ -1,0 +1,130 @@
+# save this as filter_mt_domain.py
+import win32com.client as win32
+from pathlib import Path
+
+# === SETTINGS ===
+# change this to your actual file path
+FILE_PATH = r"C:\Users\yourname\T&O_HC_30Nov25(BPM)_versionPython.xlsx"
+
+# non-pivot sheets where we will delete rows
+RAW_SHEETS = [
+    "1.HC Data",
+    "2.NewJoiners",
+    "3.Leavers",
+    "4.JR",
+    "5.FG",
+    # "6.Trf"  # EXCLUDED as per your requirement
+]
+
+# pivot sheets where we may want MT Domain + MT-1 Domain
+PIVOT_SHEETS = [
+    "1.HC Pivot",
+    "2.NewJoiners Pivot",
+    "3.Leavers Pivot",
+    "4.JR Pivot",
+    "5.FG Pivot",
+    "6.Trf Pivot",
+]
+
+ALLOWED_DOMAINS = {"CIB", "WRB", "Functions"}
+
+# Excel constants
+xlRowField = 1
+xlUp = -4162  # for .End(xlUp)
+
+
+def find_column(ws, header_name):
+    """Return column index whose row-1 value equals header_name (exact match)."""
+    used = ws.UsedRange
+    ncols = used.Columns.Count
+    for col in range(1, ncols + 1):
+        val = ws.Cells(1, col).Value
+        if isinstance(val, str) and val.strip() == header_name:
+            return col
+    return None
+
+
+def filter_raw_sheets(wb):
+    for sheet_name in RAW_SHEETS:
+        ws = wb.Worksheets(sheet_name)
+        print(f"Processing sheet: {sheet_name}")
+
+        mt_col = find_column(ws, "MT Domain")
+        if not mt_col:
+            print(f"  -> MT Domain column NOT found in {sheet_name}, skipping")
+            continue
+
+        # find last used row in that column
+        last_row = ws.Cells(ws.Rows.Count, mt_col).End(xlUp).Row
+
+        # delete from bottom up so row numbers don't shift
+        deleted = 0
+        for row in range(last_row, 1, -1):  # start at last_row, end at 2
+            val = ws.Cells(row, mt_col).Value
+            if val not in ALLOWED_DOMAINS:
+                ws.Rows(row).Delete()
+                deleted += 1
+
+        print(f"  -> Deleted {deleted} rows in {sheet_name}")
+
+
+def adjust_pivots(wb):
+    for sheet_name in PIVOT_SHEETS:
+        ws = wb.Worksheets(sheet_name)
+        print(f"Adjusting pivots on: {sheet_name}")
+
+        for pt in ws.PivotTables():
+            pt_name = pt.Name
+            print(f"  Pivot: {pt_name}")
+
+            # Try to ensure MT Domain is a Row field
+            try:
+                pf_mt = pt.PivotFields("MT Domain")
+                pf_mt.Orientation = xlRowField
+                # if it's not in rows yet, Position will error until Orientation set
+                # put it near the top; pivot may also have Cost Category above it
+                if pf_mt.Position is None:
+                    pf_mt.Position = 1
+            except Exception:
+                print("    -> MT Domain field not in this pivot, skipping MT-1 Domain logic")
+                continue
+
+            # Try to add MT-1 Domain right after MT Domain
+            try:
+                pf_mt1 = pt.PivotFields("MT-1 Domain")
+                pf_mt1.Orientation = xlRowField
+                # place it immediately after MT Domain
+                pf_mt1.Position = pf_mt.Position + 1
+                print("    -> Added MT-1 Domain next to MT Domain")
+            except Exception:
+                print("    -> MT-1 Domain field not found in this pivot (skipped)")
+
+
+def main():
+    excel = win32.Dispatch("Excel.Application")
+    excel.Visible = False  # set True if you want to see it working
+
+    wb = excel.Workbooks.Open(str(Path(FILE_PATH)))
+
+    try:
+        filter_raw_sheets(wb)
+
+        # refresh pivots after changing data
+        wb.RefreshAll()
+
+        adjust_pivots(wb)
+
+        # save as new file so original is safe (optional)
+        new_path = str(Path(FILE_PATH).with_name(
+            Path(FILE_PATH).stem + "_CIB_WRB_Functions.xlsx"
+        ))
+        wb.SaveAs(new_path)
+        print(f"Saved filtered workbook to: {new_path}")
+
+    finally:
+        wb.Close(SaveChanges=False)
+        excel.Quit()
+
+
+if __name__ == "__main__":
+    main()
