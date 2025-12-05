@@ -1,149 +1,193 @@
-import win32com.client as win32
+import shutil
 from pathlib import Path
+import openpyxl
+import win32com.client as win32
 
-# ======= SETTINGS =======
-# 1) Put your REAL full path here:
+# ====== SETTINGS ======
+# ❗❗ CHANGE THIS to your actual Excel file path
 FILE_PATH = r"C:\Users\2031146\Documents\T&O_HC_30Nov25(BPM)_versionPython.xlsx"
 
-# 2) Sheets where we filter raw data (NO pivots, NO 6.Trf)
+# Sheets where we want to filter MT Domain
 RAW_SHEETS = [
     "1.HC Data",
     "2.NewJoiners",
     "3.Leavers",
     "4.JR",
-    "5.FG",
-    # "6.Trf"  # intentionally skipped
+    "5.FG",      # 6.Trf is intentionally NOT filtered
 ]
 
-# 3) Sheets where we expect pivots
-PIVOT_SHEETS = [
-    "1.HC Pivot",
-    "2.NewJoiners Pivot",
-    "3.Leavers Pivot",
-    "4.JR Pivot",
-    "5.FG Pivot",
-    "6.Trf Pivot",
-]
-
-# 4) Which MT Domains to keep
+# Only keep these MT Domain values
 ALLOWED_DOMAINS = {"CIB", "WRB", "Functions"}
 
-# Excel constants
-xlUp = -4162
-xlRowField = 1
+
+# ---------- STEP 1: FILTER RAW SHEETS (openpyxl) ----------
+
+def filter_sheet(ws):
+    """Keep only rows where MT Domain is in ALLOWED_DOMAINS."""
+    header = [cell.value for cell in ws[1]]
+
+    # Find MT Domain column
+    try:
+        mt_col = header.index("MT Domain")
+    except ValueError:
+        print(f"[{ws.title}] MT Domain column not found, skipping.")
+        return
+
+    print(f"[{ws.title}] MT Domain found at column {mt_col + 1}")
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        print(f"[{ws.title}] Sheet is empty, skipping.")
+        return
+
+    # Build filtered rows: header + only allowed MT domains
+    new_rows = [rows[0]]  # header
+    for row in rows[1:]:
+        val = row[mt_col]
+        if isinstance(val, str):
+            val_clean = val.strip()
+        else:
+            val_clean = val
+
+        if val_clean in ALLOWED_DOMAINS:
+            new_rows.append(row)
+
+    print(f"[{ws.title}] Kept {len(new_rows) - 1} rows, "
+          f"deleted {len(rows) - len(new_rows)} rows")
+
+    # Clear sheet
+    ws.delete_rows(1, ws.max_row)
+
+    # Write filtered rows back
+    for r, row in enumerate(new_rows, start=1):
+        for c, value in enumerate(row, start=1):
+            ws.cell(row=r, column=c, value=value)
 
 
-def find_column(ws, header_name):
-    """Return col index (1-based) where row 1 == header_name."""
-    used = ws.UsedRange
-    ncols = used.Columns.Count
-    for col in range(1, ncols + 1):
-        val = ws.Cells(1, col).Value
-        if isinstance(val, str) and val.strip() == header_name:
-            return col
-    return None
+def create_filtered_xlsx():
+    """Copy original file and filter it, returning path to _filtered.xlsx."""
+    src = Path(FILE_PATH)
+    if not src.exists():
+        raise FileNotFoundError(f"Original Excel file not found: {src}")
 
+    # Create copy
+    dst = src.with_name(src.stem + "_filtered.xlsx")
+    shutil.copy2(src, dst)
+    print(f"Copied original file to:\n{dst}")
 
-def filter_raw_sheets(wb):
-    """Keep only rows with allowed MT Domain values in RAW_SHEETS."""
+    # Load copy and filter raw sheets
+    wb = openpyxl.load_workbook(dst, data_only=False)
+
     for sheet_name in RAW_SHEETS:
-        ws = wb.Worksheets(sheet_name)
-        print(f"[RAW] Processing sheet: {sheet_name}")
+        ws = wb[sheet_name]
+        filter_sheet(ws)
 
-        mt_col = find_column(ws, "MT Domain")
-        if not mt_col:
-            print(f"   -> MT Domain column NOT found, skipping.")
-            continue
-
-        last_row = ws.Cells(ws.Rows.Count, mt_col).End(xlUp).Row
-        deleted = 0
-
-        # delete from bottom up so row numbers don't shift
-        for row in range(last_row, 1, -1):
-            val = ws.Cells(row, mt_col).Value
-            if val not in ALLOWED_DOMAINS:
-                ws.Rows(row).Delete()
-                deleted += 1
-
-        print(f"   -> Deleted {deleted} rows.")
+    wb.save(dst)
+    print("\n✅ Filtering complete! Filtered workbook saved as:")
+    print(dst)
+    return dst
 
 
-def adjust_pivots(wb):
-    """Refresh pivots & set MT Domain + MT-1 Domain as row fields."""
-    for sheet_name in PIVOT_SHEETS:
-        ws = wb.Worksheets(sheet_name)
-        print(f"[PIVOT] Sheet: {sheet_name}")
+# ---------- STEP 2: ADD MACRO + AUTO-RUN (pywin32 / Excel COM) ----------
 
-        for pt in ws.PivotTables():
-            print(f"   Pivot: {pt.Name}")
-            pt.PivotCache().Refresh()
-            pt.RefreshTable()
+VBA_MODULE_CODE = r'''
+Sub RefreshPivots_MTDomain()
+    Dim ws As Worksheet
+    Dim pt As PivotTable
+    Dim pf As PivotField
 
-            # Ensure MT Domain row field
-            try:
-                pf_mt = pt.PivotFields("MT Domain")
-                pf_mt.Orientation = xlRowField
-                # position 1 (or keep existing position if already set)
-                pf_mt.Position = 1
-            except Exception:
-                print("      -> MT Domain field missing in this pivot, skipping MT-1 Domain.")
-                continue
+    For Each ws In ThisWorkbook.Worksheets
+        For Each pt In ws.PivotTables
 
-            # Add MT-1 Domain right after MT Domain (if exists)
-            try:
-                pf_mt1 = pt.PivotFields("MT-1 Domain")
-                pf_mt1.Orientation = xlRowField
-                pf_mt1.Position = pf_mt.Position + 1
-                print("      -> MT-1 Domain placed next to MT Domain.")
-            except Exception:
-                print("      -> MT-1 Domain field not found in this pivot.")
+            pt.RefreshTable
+
+            On Error Resume Next
+
+            ' MT Domain as first row field
+            Set pf = pt.PivotFields("MT Domain")
+            pf.Orientation = xlRowField
+            pf.Position = 1
+
+            ' MT-1 Domain next (if exists)
+            Set pf = pt.PivotFields("MT-1 Domain")
+            pf.Orientation = xlRowField
+            pf.Position = 2
+
+            On Error GoTo 0
+
+        Next pt
+    Next ws
+End Sub
+'''.strip()
 
 
-def main():
-    src_path = Path(FILE_PATH)
-    if not src_path.exists():
-        raise FileNotFoundError(f"File not found: {src_path}")
+VBA_THISWORKBOOK_CODE = r'''
+Private Sub Workbook_Open()
+    Call RefreshPivots_MTDomain
+End Sub
+'''.strip()
 
-    # New file name with suffix
-    dst_path = src_path.with_name(src_path.stem + "_CIB_WRB_Functions.xlsx")
 
-    # Start Excel in the background
+def add_macro_and_save_as_xlsm(filtered_xlsx_path: Path) -> Path:
+    """Open filtered xlsx in Excel, save as xlsm, inject macro."""
     excel = win32.DispatchEx("Excel.Application")
     excel.Visible = False
     excel.DisplayAlerts = False
 
-    print(f"Opening original: {src_path}")
-    wb_src = excel.Workbooks.Open(str(src_path))
-
-    # Make a copy on disk
-    print(f"Saving copy as: {dst_path}")
-    wb_src.SaveCopyAs(str(dst_path))
-    wb_src.Close(SaveChanges=False)
-
-    # Now work ONLY on the copy
-    wb = excel.Workbooks.Open(str(dst_path))
+    print(f"\nOpening filtered workbook in Excel:\n{filtered_xlsx_path}")
+    wb = excel.Workbooks.Open(str(filtered_xlsx_path))
 
     try:
-        print("\n=== Filtering raw sheets ===")
-        filter_raw_sheets(wb)
+        # Save as xlsm
+        xlsm_path = filtered_xlsx_path.with_suffix(".xlsm")
+        print(f"Saving as macro-enabled workbook:\n{xlsm_path}")
+        # FileFormat 52 = xlOpenXMLWorkbookMacroEnabled
+        wb.SaveAs(str(xlsm_path), FileFormat=52)
 
-        print("\n=== Refreshing & adjusting pivots ===")
-        # global refresh
-        wb.RefreshAll()
-        adjust_pivots(wb)
+        # Access VBProject (may require 'Trust access to VBA project object model')
+        vbproj = wb.VBProject
+
+        # 1 = Standard module
+        std_module = vbproj.VBComponents.Add(1)
+        std_module.Name = "modRefreshPivots"
+        std_module.CodeModule.AddFromString(VBA_MODULE_CODE)
+
+        # Add Workbook_Open in ThisWorkbook (clear existing code first)
+        thiswb = vbproj.VBComponents("ThisWorkbook")
+        cm = thiswb.CodeModule
+        if cm.CountOfLines > 0:
+            cm.DeleteLines(1, cm.CountOfLines)
+        cm.AddFromString(VBA_THISWORKBOOK_CODE)
 
         wb.Save()
-        print(f"\nDone. New filtered file ready:\n{dst_path}")
+        print("\n✅ Macro injected and xlsm saved:")
+        print(xlsm_path)
+        return xlsm_path
+
+    except Exception as e:
+        print("\n⚠️ Could not inject macro via Python.")
+        print("This is often because 'Trust access to the VBA project object model' is disabled.")
+        print("Error details:")
+        print(e)
+        print("\nYou can still use the _filtered.xlsx file, and paste the VBA manually if needed.")
+        return filtered_xlsx_path
 
     finally:
         wb.Close(SaveChanges=True)
         excel.Quit()
 
 
+# ---------- MAIN ----------
+
+def main():
+    filtered_xlsx = create_filtered_xlsx()
+    final_file = add_macro_and_save_as_xlsm(filtered_xlsx)
+
+    print("\n🎉 All done!")
+    print("Final file ready:\n", final_file)
+    print("\nWhen you open this file in Excel and enable macros,")
+    print("it will automatically refresh all pivots and set MT Domain / MT-1 Domain.")
+
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
